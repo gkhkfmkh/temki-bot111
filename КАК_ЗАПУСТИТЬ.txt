@@ -1,0 +1,4 @@
+Инструкция находится в README_DEPLOY_RU.md.
+Главный запуск Windows: start.bat
+Главный запуск Linux/хостинг: python server.py
+Проверка: python server.py --doctor

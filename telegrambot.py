@@ -1,0 +1,224 @@
+from __future__ import annotations
+from colorama import Fore
+from aiogram import Bot, Dispatcher
+from aiogram.client.telegram import TelegramAPIServer
+from aiogram.types import BotCommand, InlineKeyboardMarkup
+from aiogram.client.session.aiohttp import AiohttpSession
+
+import asyncio
+from threading import Event
+import textwrap
+import logging
+
+from settings import Settings as sett
+from core.modules import get_modules
+from core.handlers import call_bot_event
+from core.notify import get_connection
+from utils import normalize_custom_api_url
+
+from . import router as main_router
+from . import templates as templ
+
+
+logger = logging.getLogger("universal.telegram")
+
+
+def get_telegram_bot() -> TelegramBot | None:
+    if hasattr(TelegramBot, "instance"):
+        return getattr(TelegramBot, "instance")
+
+
+def get_telegram_bot_loop() -> asyncio.AbstractEventLoop | None:
+    if hasattr(get_telegram_bot(), "loop"):
+        return getattr(get_telegram_bot(), "loop")
+
+
+class TelegramBot:
+    def __new__(cls, *args, **kwargs) -> TelegramBot:
+        if not hasattr(cls, "instance"):
+            cls.instance = super(TelegramBot, cls).__new__(cls)
+        return getattr(cls, "instance")
+
+    def __init__(self):
+        logging.getLogger("aiogram").setLevel(logging.CRITICAL)
+        logging.getLogger("aiogram.event").setLevel(logging.CRITICAL)
+        logging.getLogger("aiogram.dispatcher").setLevel(logging.CRITICAL)
+        
+        config = sett.get("config")
+        connection = get_connection() # при запуске могли переключиться на запасное подключение, если прокси не ответил
+        self.token = config["telegram"]["api"]["token"]
+        self.proxy = connection["proxy"]
+        self.custom_api_url = connection["custom_api_url"]
+
+        if self.proxy:
+            session = AiohttpSession(proxy=f"http://{self.proxy}")
+        else:
+            session = None
+
+        self.bot = Bot(token=self.token, session=session)
+
+        # Кастомный URL Telegram API — ставим на session.api,
+        # т.к. Bot() в aiogram 3.30 не принимает server=
+        if self.custom_api_url:
+            self.custom_api_url = normalize_custom_api_url(self.custom_api_url)
+            self.bot.session.api = TelegramAPIServer.from_base(self.custom_api_url)
+
+        self.dp = Dispatcher()
+        self.me = None
+        self.loop = None
+        self._ready = Event()
+        self._start_error = None
+
+        self.attach_modules(get_modules())
+        self.dp.include_router(main_router)
+
+    def attach_modules(self, modules: list):
+        for module in modules:
+            for router in module.telegram_bot_routers:
+                if router.parent_router is None:
+                    main_router.include_router(router)
+
+    async def refresh_polling(self):
+        # их ON_TELEGRAM_BOT_INIT догнал _enable_module, тут только поллинг под новые роутеры
+        self._polling_restart = asyncio.create_task(self._restart_polling())
+
+    async def _restart_polling(self):
+        # aiogram считает allowed_updates при старте поллинга — у новых роутеров могут быть свои типы апдейтов
+        try:
+            await self.dp.stop_polling()
+        except RuntimeError:
+            pass
+
+    async def _set_main_menu(self):
+        try:
+            main_menu_commands = [
+                BotCommand(command="/start", description="🏠 Главное меню"),
+                BotCommand(command="/restart", description="🔄️ Перезагрузить")
+            ]
+            await self.bot.set_my_commands(main_menu_commands)
+        except:
+            pass
+
+    async def _set_short_description(self):
+        try:
+            short_description = textwrap.dedent(f"""
+                Playerok Universal — бесплатный бот-помощник для playerok.com
+                
+                📢 @friedplayerok
+                🤖 @friedshopbot
+                🧑‍💻 devfried.com
+            """)
+            await self.bot.set_my_short_description(short_description=short_description)
+        except:
+            pass
+
+    async def _set_description(self):
+        try:
+            description = textwrap.dedent(f"""
+                💙 𝐏𝐋𝐀𝐘𝐄𝐑𝐎𝐊 𝐔𝐍𝐈𝐕𝐄𝐑𝐒𝐀𝐋 💙
+                                          
+                🟢 Вечный онлайн
+                ♻️ Авто-восстановление товаров
+                ⬆️ Авто-поднятие товаров
+                💸 Авто-вывод средств
+                🚀 Авто-выдача товаров
+                ❗ Кастомные команды
+                💬 Вызов продавца
+                👋 Приветственное сообщение
+                📊 Подробная статистика
+                📲 Управление в Telegram
+                🔔 Уведомления о событиях
+                🖌️ Кастомизация
+                🔌 Плагины
+                                        
+                ⬇️ Скачать бота: https://github.com/alleexxeeyy/playerok-universal
+                
+                📢 Новости: @friedplayerok
+                🤖 Плагины: @friedshopbot
+                🧑‍💻 Разработка: https://devfried.com
+            """)
+            await self.bot.set_my_description(description=description)
+        except:
+            pass
+
+    async def run_bot(self):
+        self.loop = asyncio.get_running_loop()
+
+        try:
+            await self._set_main_menu()
+            await self._set_short_description()
+            await self._set_description()
+            await call_bot_event("ON_TELEGRAM_BOT_INIT", [self])
+            self.me = await self.bot.get_me()
+        except BaseException as exc:
+            self._start_error = exc
+            self._ready.set()
+            raise
+        self._ready.set()
+        started = f"{Fore.LIGHTBLUE_EX}Telegram бот {Fore.LIGHTWHITE_EX}@{self.me.username} {Fore.LIGHTBLUE_EX}запущен и активен"
+
+        if self.proxy:
+            from core.console import log_panel
+
+            if "@" in self.proxy:
+                user, password = self.proxy.split("@")[0].split(":")
+                ip, port = self.proxy.split("@")[1].split(":")
+            else:
+                user, password = None, None
+                ip, port = self.proxy.split(":")
+            ip = ".".join([("*" * len(nums)) if i >= 3 else nums for i, nums in enumerate(ip.split("."), start=1)])
+            rows = [("IP", f"{ip}:{port[:3]}**")]
+            if user:
+                rows.append(("Юзер", f"{user[:3]}*****"))
+            log_panel(logger, "🌐 Прокси для Telegram", rows, message=started, color="bright_blue", width=64)
+        else:
+            logger.info(started)
+
+        drop_updates = True  # сбрасываем очередь только при первом запуске
+        failures = 0
+        while True:
+            try:
+                # И delete_webhook, и start_polling могут временно падать по сети.
+                await self.bot.delete_webhook(drop_pending_updates=drop_updates)
+                drop_updates = False
+                await self.dp.start_polling(self.bot, handle_signals=False)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                failures += 1
+                delay = min(60, 3 * (2 ** min(failures - 1, 5)))
+                logger.exception("Telegram polling: переподключение через %s сек.", delay)
+                await asyncio.sleep(delay)
+            else:
+                # stop_polling() вызывается при обновлении списка роутеров.
+                failures = 0
+                await asyncio.sleep(0.5)
+
+    async def call_seller(self, username: str, chat_id: int | str):
+        config = sett.get("config")
+        for user_id in config["telegram"]["bot"]["signed_users"]:
+            await self.bot.send_message(
+                chat_id=user_id, 
+                text=templ.call_seller_text(username, chat_id),
+                reply_markup=templ.call_seller_kb(chat_id),
+                parse_mode="HTML"
+            )
+        
+    async def log_event(self, text: str, kb: InlineKeyboardMarkup | None = None):
+        config = sett.get("config")
+        chat_id = config["playerok"]["notifications"]["chat_id"]
+        if not chat_id:
+            for user_id in config["telegram"]["bot"]["signed_users"]:
+                await self.bot.send_message(
+                    chat_id=user_id, 
+                    text=text, 
+                    reply_markup=kb, 
+                    parse_mode="HTML"
+                )
+        else:
+            await self.bot.send_message(
+                chat_id=chat_id, 
+                text=f'{text}\n<span class="tg-spoiler">Переключите чат логов на чат с ботом, чтобы отображалось меню с действиями</span>', 
+                reply_markup=None, 
+                parse_mode="HTML"
+            )
